@@ -1,0 +1,92 @@
+# Update Victor formula when a new release is published
+name: Update Formula
+
+on:
+  repository_dispatch:
+    types: [update-formula]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to update to (e.g., 0.2.0)'
+        required: true
+        type: string
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.client_payload.version }}" ]; then
+            echo "VERSION=${{ github.event.client_payload.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download and compute SHA256
+        id: sha256
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          URL="https://files.pythonhosted.org/packages/source/v/victor-ai/victor_ai-${VERSION}.tar.gz"
+
+          # Wait for PyPI to be available (may take a few minutes after release)
+          for i in {1..10}; do
+            if curl -sI "$URL" | grep -q "200 OK"; then
+              break
+            fi
+            echo "Waiting for PyPI package to be available... (attempt $i/10)"
+            sleep 30
+          done
+
+          # Download and compute SHA256
+          curl -sL "$URL" -o victor.tar.gz
+          SHA256=$(sha256sum victor.tar.gz | cut -d' ' -f1)
+          echo "SHA256=$SHA256" >> $GITHUB_OUTPUT
+          echo "Computed SHA256: $SHA256"
+
+      - name: Update formula
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          SHA256="${{ steps.sha256.outputs.SHA256 }}"
+
+          cat > Formula/victor.rb << 'EOF'
+          # typed: false
+          # frozen_string_literal: true
+
+          class Victor < Formula
+            include Language::Python::Virtualenv
+
+            desc "Enterprise-Ready AI Coding Assistant - Any model, any provider"
+            homepage "https://github.com/vjsingh1984/victor"
+            url "https://files.pythonhosted.org/packages/source/v/victor-ai/victor_ai-VERSION_PLACEHOLDER.tar.gz"
+            sha256 "SHA256_PLACEHOLDER"
+            license "Apache-2.0"
+
+            depends_on "python@3.12"
+
+            def install
+              virtualenv_install_with_resources
+            end
+
+            test do
+              assert_match "victor", shell_output("#{bin}/victor --version")
+            end
+          end
+          EOF
+
+          # Replace placeholders
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" Formula/victor.rb
+          sed -i "s/SHA256_PLACEHOLDER/${SHA256}/g" Formula/victor.rb
+
+          cat Formula/victor.rb
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/victor.rb
+          git commit -m "Update victor to ${{ steps.version.outputs.VERSION }}"
+          git push
