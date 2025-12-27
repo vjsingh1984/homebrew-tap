@@ -1,44 +1,76 @@
-# Update Victor formula when a new release is published
+# Auto-update Victor formula when new releases are published
+# Uses scheduled polling - no cross-repo tokens needed
 name: Update Formula
 
 on:
-  repository_dispatch:
-    types: [update-formula]
+  # Check for new releases every 6 hours
+  schedule:
+    - cron: '0 */6 * * *'
+  # Manual trigger
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to update to (e.g., 0.2.0)'
-        required: true
+        description: 'Version to update to (e.g., 0.2.0). Leave empty to auto-detect latest.'
+        required: false
         type: string
 
 jobs:
-  update:
+  check-and-update:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get version
-        id: version
+      - name: Get latest release version
+        id: latest
         run: |
-          if [ -n "${{ github.event.client_payload.version }}" ]; then
-            echo "VERSION=${{ github.event.client_payload.version }}" >> $GITHUB_OUTPUT
-          else
+          if [ -n "${{ github.event.inputs.version }}" ]; then
             echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "Using manual version: ${{ github.event.inputs.version }}"
+          else
+            # Get latest release from GitHub API (no auth needed for public repos)
+            VERSION=$(curl -s https://api.github.com/repos/vjsingh1984/victor/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+            echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+            echo "Latest release version: $VERSION"
+          fi
+
+      - name: Get current formula version
+        id: current
+        run: |
+          CURRENT=$(grep -oP 'victor_ai-\K[0-9.]+' Formula/victor.rb | head -1 || echo "0.0.0")
+          echo "VERSION=$CURRENT" >> $GITHUB_OUTPUT
+          echo "Current formula version: $CURRENT"
+
+      - name: Check if update needed
+        id: check
+        run: |
+          if [ "${{ steps.latest.outputs.VERSION }}" != "${{ steps.current.outputs.VERSION }}" ] && [ -n "${{ steps.latest.outputs.VERSION }}" ]; then
+            echo "UPDATE=true" >> $GITHUB_OUTPUT
+            echo "Update needed: ${{ steps.current.outputs.VERSION }} -> ${{ steps.latest.outputs.VERSION }}"
+          else
+            echo "UPDATE=false" >> $GITHUB_OUTPUT
+            echo "No update needed"
           fi
 
       - name: Download and compute SHA256
+        if: steps.check.outputs.UPDATE == 'true'
         id: sha256
         run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
+          VERSION="${{ steps.latest.outputs.VERSION }}"
           URL="https://files.pythonhosted.org/packages/source/v/victor-ai/victor_ai-${VERSION}.tar.gz"
 
+          echo "Downloading from: $URL"
+
           # Wait for PyPI to be available (may take a few minutes after release)
-          for i in {1..10}; do
-            if curl -sI "$URL" | grep -q "200 OK"; then
+          for i in {1..5}; do
+            HTTP_CODE=$(curl -sI -o /dev/null -w "%{http_code}" "$URL")
+            if [ "$HTTP_CODE" = "200" ]; then
               break
             fi
-            echo "Waiting for PyPI package to be available... (attempt $i/10)"
-            sleep 30
+            echo "Waiting for PyPI package... (attempt $i/5, got HTTP $HTTP_CODE)"
+            sleep 60
           done
 
           # Download and compute SHA256
@@ -48,11 +80,12 @@ jobs:
           echo "Computed SHA256: $SHA256"
 
       - name: Update formula
+        if: steps.check.outputs.UPDATE == 'true'
         run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
+          VERSION="${{ steps.latest.outputs.VERSION }}"
           SHA256="${{ steps.sha256.outputs.SHA256 }}"
 
-          cat > Formula/victor.rb << 'EOF'
+          cat > Formula/victor.rb << EOF
           # typed: false
           # frozen_string_literal: true
 
@@ -61,8 +94,8 @@ jobs:
 
             desc "Enterprise-Ready AI Coding Assistant - Any model, any provider"
             homepage "https://github.com/vjsingh1984/victor"
-            url "https://files.pythonhosted.org/packages/source/v/victor-ai/victor_ai-VERSION_PLACEHOLDER.tar.gz"
-            sha256 "SHA256_PLACEHOLDER"
+            url "https://files.pythonhosted.org/packages/source/v/victor-ai/victor_ai-${VERSION}.tar.gz"
+            sha256 "${SHA256}"
             license "Apache-2.0"
 
             depends_on "python@3.12"
@@ -77,16 +110,14 @@ jobs:
           end
           EOF
 
-          # Replace placeholders
-          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" Formula/victor.rb
-          sed -i "s/SHA256_PLACEHOLDER/${SHA256}/g" Formula/victor.rb
-
+          echo "Updated formula:"
           cat Formula/victor.rb
 
       - name: Commit and push
+        if: steps.check.outputs.UPDATE == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/victor.rb
-          git commit -m "Update victor to ${{ steps.version.outputs.VERSION }}"
+          git diff --staged --quiet || git commit -m "Update victor to ${{ steps.latest.outputs.VERSION }}"
           git push
